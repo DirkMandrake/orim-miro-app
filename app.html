@@ -12,107 +12,170 @@
       .muted { color: #6a737d; font-size: 12px; }
       #drop { margin: 12px 0; padding: 22px 12px; border: 2px dashed #b0b7c3; border-radius: 10px; text-align: center; outline: none; cursor: text; }
       #drop:focus { border-color: #1971c2; background: #f1f7fe; }
-      button { font: inherit; padding: 6px 10px; margin: 0 6px 6px 0; border: 1px solid #c4c9d0; border-radius: 6px; background: #fff; cursor: pointer; }
-      button:hover { border-color: #1971c2; }
+      #drop.busy { border-color: #e8590c; background: #fff4e6; }
       #log { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
       .ok { color: #2b8a3e; }
       .err { color: #c92a2a; }
+      .warn { color: #b35c00; }
     </style>
   </head>
   <body>
     <h1>Orim → Miro</h1>
-    <div class="muted">Trial version 1 (2026-11-03). Nothing leaves your browser: what you paste here goes only to this board.</div>
+    <div class="muted">Version 2 (2026-11-04). Nothing leaves your browser: what you paste here is created on this board, as you.</div>
     <div id="drop" tabindex="0">Click here, then press <b>Ctrl+V</b></div>
-    <div class="muted">For the trial: in Orim, right-click a picture → <i>Copy as image</i>, or copy some text anywhere — then paste it here. It lands in the middle of your view.</div>
-    <p>
-      <button id="t-note">Test: a note</button>
-      <button id="t-pic">Test: a picture</button>
-      <button id="t-big">Test: a big picture (~6 MB)</button>
-    </p>
+    <div class="muted">
+      In Orim, select things and press <b>Ctrl+C</b>. Without pictures you can also press Ctrl+V straight on the board;
+      with pictures, paste here — everything lands in the middle of your view.
+    </div>
     <div id="log"></div>
     <script>
+      const drop = document.getElementById('drop');
       const log = (text, kind = '') => {
         const d = document.createElement('div');
         d.className = kind;
         d.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
         document.getElementById('log').prepend(d);
       };
+      const fail = (what, e) => log(`${what}: ${e?.message ?? e}`, 'err');
       const centre = async () => {
         const v = await miro.board.viewport.get();
         return { x: v.x + v.width / 2, y: v.y + v.height / 2, w: v.width };
       };
-      const show = async (items) => {
+      const readAsDataUrl = (blob) =>
+        new Promise((res, rej) => {
+          const r = new FileReader();
+          r.onload = () => res(r.result);
+          r.onerror = () => rej(r.error);
+          r.readAsDataURL(blob);
+        });
+      const fromB64 = (s) => new TextDecoder().decode(Uint8Array.from(atob(s), (c) => c.charCodeAt(0)));
+
+      /** Orim's plan (written by Orim's Ctrl+C into the HTML of the clipboard). */
+      function planOf(html) {
+        const m = /data-orim-miro="([A-Za-z0-9+/=]+)"/.exec(html || '');
+        if (!m) return null;
         try {
-          await miro.board.select({ id: items.map((i) => i.id) });
+          const j = JSON.parse(fromB64(m[1]));
+          return j && j.format === 'orim-miro' ? j : null;
+        } catch {
+          return null;
+        }
+      }
+
+      const MAKE = {
+        sticky_note: (p) => miro.board.createStickyNote(p),
+        shape: (p) => miro.board.createShape(p),
+        text: (p) => miro.board.createText(p),
+        image: (p) => miro.board.createImage(p),
+        frame: (p) => miro.board.createFrame(p),
+        card: (p) => miro.board.createCard(p),
+        embed: (p) => miro.board.createEmbed(p),
+      };
+      // what a second try leaves out when Miro refuses something (a font or a link it does not take, …)
+      function simpler(props) {
+        const p = { ...props };
+        delete p.linkedTo;
+        delete p.rotation;
+        if (p.style) {
+          p.style = { ...p.style };
+          delete p.style.fontFamily;
+          delete p.style.borderOpacity;
+        }
+        return p;
+      }
+
+      async function runPlan(plan) {
+        if (plan.pending > 0) {
+          log(`Orim is still preparing ${plan.pending} picture(s) — wait a moment, then press Ctrl+V here again.`, 'warn');
+          return;
+        }
+        const c = await centre();
+        const made = new Map();
+        const errors = [];
+        const t0 = performance.now();
+        const total = plan.items.length;
+        let done = 0;
+        for (const it of plan.items) {
+          const props = { ...it.props, x: (it.props.x ?? 0) + c.x, y: (it.props.y ?? 0) + c.y };
+          try {
+            let item;
+            try {
+              item = await MAKE[it.type](props);
+            } catch (e) {
+              item = await MAKE[it.type](simpler(props));
+            }
+            made.set(it.ref, item);
+          } catch (e) {
+            errors.push(`${it.type}: ${e?.message ?? e}`);
+          }
+          done++;
+          if (done % 20 === 0) log(`… ${done} / ${total}`);
+        }
+        for (const f of plan.frames) {
+          const frame = made.get(f.frame);
+          if (!frame) continue;
+          for (const ref of f.children) {
+            const child = made.get(ref);
+            if (child) await frame.add(child).catch(() => undefined);
+          }
+        }
+        let lines = 0;
+        for (const k of plan.connectors) {
+          const a = made.get(k.start.ref);
+          const b = made.get(k.end.ref);
+          if (!a || !b) continue;
+          try {
+            await miro.board.createConnector({ ...k.props, start: { item: a.id, position: k.start.position }, end: { item: b.id, position: k.end.position } });
+            lines++;
+          } catch (e) {
+            errors.push(`line: ${e?.message ?? e}`);
+          }
+        }
+        for (const g of plan.groups) {
+          const items = g.map((r) => made.get(r)).filter(Boolean);
+          if (items.length > 1) await miro.board.group({ items }).catch((e) => errors.push(`group: ${e?.message ?? e}`));
+        }
+        const pics = plan.items.filter((i) => i.type === 'image' && made.has(i.ref)).length;
+        log(`Created ${made.size} of ${total} object(s)${pics ? ` (${pics} picture(s))` : ''}${lines ? ` and ${lines} line(s)` : ''} in ${((performance.now() - t0) / 1000).toFixed(1)} s.`, errors.length ? 'warn' : 'ok');
+        for (const d of plan.dropped || []) log(`Left out: ${d}`, 'warn');
+        for (const e of [...new Set(errors)].slice(0, 8)) log(`Miro refused ${e}`, 'err');
+        try {
+          await miro.board.select({ id: [...made.values()].map((i) => i.id) });
         } catch {
           /* selecting is a nicety */
         }
-      };
-      async function note(text) {
-        const c = await centre();
-        const n = await miro.board.createStickyNote({ content: text.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]).slice(0, 6000), x: c.x, y: c.y });
-        await show([n]);
-        log(`Note created (${text.length} characters).`, 'ok');
       }
-      async function picture(dataUrl, label) {
-        const c = await centre();
-        const t0 = performance.now();
-        const img = await miro.board.createImage({ url: dataUrl, x: c.x, y: c.y, width: Math.min(800, c.w * 0.4) });
-        await show([img]);
-        log(`Picture created: ${label}, ${(dataUrl.length / 1048576).toFixed(1)} MB as data, ${Math.round(performance.now() - t0)} ms.`, 'ok');
-      }
-      const fail = (what, e) => log(`${what} failed: ${e?.message ?? e}`, 'err');
-      const readAsDataUrl = (blob) => new Promise((res, rej) => {
-        const r = new FileReader();
-        r.onload = () => res(r.result);
-        r.onerror = () => rej(r.error);
-        r.readAsDataURL(blob);
-      });
-      // the bridge: a paste into this panel
+
       document.addEventListener('paste', async (e) => {
         e.preventDefault();
         const dt = e.clipboardData;
         if (!dt) return log('The paste had no data.', 'err');
-        log(`Pasted: ${[...dt.types].join(', ') || 'nothing'}`);
-        const files = [...dt.files].filter((f) => f.type.startsWith('image/'));
+        drop.classList.add('busy');
         try {
+          const plan = planOf(dt.getData('text/html'));
+          if (plan) return await runPlan(plan);
+          // not from Orim: pictures, else text as a note
+          const files = [...dt.files].filter((f) => f.type.startsWith('image/'));
           if (files.length) {
-            for (const f of files.slice(0, 20)) await picture(await readAsDataUrl(f), `${f.type}, ${(f.size / 1048576).toFixed(1)} MB`);
-            return;
+            const c = await centre();
+            for (const f of files.slice(0, 20)) await miro.board.createImage({ url: await readAsDataUrl(f), x: c.x, y: c.y, width: Math.min(800, c.w * 0.4) });
+            return log(`${files.length} picture(s) created.`, 'ok');
           }
           const text = dt.getData('text/plain');
-          if (text) return await note(text);
-          log('Nothing in the paste this trial can use (pictures or text).', 'err');
+          if (text) {
+            const c = await centre();
+            await miro.board.createStickyNote({ content: text.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]).slice(0, 6000), x: c.x, y: c.y });
+            return log('Text created as a note.', 'ok');
+          }
+          log('Nothing in the paste to create (copy in Orim with Ctrl+C first).', 'err');
         } catch (err) {
-          fail('Creating it on the board', err);
+          fail('Creating it on the board failed', err);
+        } finally {
+          drop.classList.remove('busy');
         }
       });
-      function testPng(w, h, noisy) {
-        const cv = document.createElement('canvas');
-        cv.width = w;
-        cv.height = h;
-        const g = cv.getContext('2d');
-        const grad = g.createLinearGradient(0, 0, w, h);
-        grad.addColorStop(0, '#1971c2');
-        grad.addColorStop(1, '#e8590c');
-        g.fillStyle = grad;
-        g.fillRect(0, 0, w, h);
-        if (noisy) {
-          // noise makes the file big (the size-limit test)
-          const d = g.getImageData(0, 0, w, h);
-          for (let i = 0; i < d.data.length; i += 4) d.data[i] = (d.data[i] + Math.random() * 120) | 0;
-          g.putImageData(d, 0, 0);
-        }
-        g.fillStyle = '#fff';
-        g.font = `bold ${Math.round(h / 8)}px sans-serif`;
-        g.fillText('Orim → Miro', w * 0.08, h * 0.55);
-        return cv.toDataURL('image/png');
-      }
-      document.getElementById('t-note').onclick = () => note('Hello from the Orim app').catch((e) => fail('The test note', e));
-      document.getElementById('t-pic').onclick = () => picture(testPng(800, 500, false), 'test 800 × 500').catch((e) => fail('The test picture', e));
-      document.getElementById('t-big').onclick = () => picture(testPng(2400, 1600, true), 'test 2400 × 1600, noisy').catch((e) => fail('The big test picture', e));
-      document.getElementById('drop').focus();
-      miro.board.getInfo().then((b) => log(`Ready on board ${b.id}.`, 'ok')).catch((e) => fail('Talking to Miro', e));
+      drop.focus();
+      miro.board.getInfo().then(() => log('Ready.', 'ok')).catch((e) => fail('Talking to Miro failed', e));
     </script>
   </body>
 </html>
