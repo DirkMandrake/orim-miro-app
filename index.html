@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Orim</title>
+    <!-- The Orim Miro app (item 61, trial). Miro loads this page invisibly on the board; a click on the app's
+         icon opens app.html as the side panel. No server: everything runs in the browser. -->
+    <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+  </head>
+  <body>
+    <script>
+      miro.board.ui.on('icon:click', async () => {
+        await miro.board.ui.openPanel({ url: 'app.html' });
+      });
+    </script>
+  </body>
+</html>
