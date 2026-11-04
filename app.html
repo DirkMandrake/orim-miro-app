@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orim</title>
+    <script src="https://miro.com/app/static/sdk/v2/miro.js"></script>
+    <style>
+      :root { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #1f2328; }
+      body { margin: 0; padding: 14px; }
+      h1 { font-size: 16px; margin: 0 0 4px; }
+      .muted { color: #6a737d; font-size: 12px; }
+      #drop { margin: 12px 0; padding: 22px 12px; border: 2px dashed #b0b7c3; border-radius: 10px; text-align: center; outline: none; cursor: text; }
+      #drop:focus { border-color: #1971c2; background: #f1f7fe; }
+      button { font: inherit; padding: 6px 10px; margin: 0 6px 6px 0; border: 1px solid #c4c9d0; border-radius: 6px; background: #fff; cursor: pointer; }
+      button:hover { border-color: #1971c2; }
+      #log { margin-top: 10px; font-size: 12px; white-space: pre-wrap; }
+      .ok { color: #2b8a3e; }
+      .err { color: #c92a2a; }
+    </style>
+  </head>
+  <body>
+    <h1>Orim → Miro</h1>
+    <div class="muted">Trial version 1 (2026-11-03). Nothing leaves your browser: what you paste here goes only to this board.</div>
+    <div id="drop" tabindex="0">Click here, then press <b>Ctrl+V</b></div>
+    <div class="muted">For the trial: in Orim, right-click a picture → <i>Copy as image</i>, or copy some text anywhere — then paste it here. It lands in the middle of your view.</div>
+    <p>
+      <button id="t-note">Test: a note</button>
+      <button id="t-pic">Test: a picture</button>
+      <button id="t-big">Test: a big picture (~6 MB)</button>
+    </p>
+    <div id="log"></div>
+    <script>
+      const log = (text, kind = '') => {
+        const d = document.createElement('div');
+        d.className = kind;
+        d.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
+        document.getElementById('log').prepend(d);
+      };
+      const centre = async () => {
+        const v = await miro.board.viewport.get();
+        return { x: v.x + v.width / 2, y: v.y + v.height / 2, w: v.width };
+      };
+      const show = async (items) => {
+        try {
+          await miro.board.select({ id: items.map((i) => i.id) });
+        } catch {
+          /* selecting is a nicety */
+        }
+      };
+      async function note(text) {
+        const c = await centre();
+        const n = await miro.board.createStickyNote({ content: text.replace(/[&<>]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch]).slice(0, 6000), x: c.x, y: c.y });
+        await show([n]);
+        log(`Note created (${text.length} characters).`, 'ok');
+      }
+      async function picture(dataUrl, label) {
+        const c = await centre();
+        const t0 = performance.now();
+        const img = await miro.board.createImage({ url: dataUrl, x: c.x, y: c.y, width: Math.min(800, c.w * 0.4) });
+        await show([img]);
+        log(`Picture created: ${label}, ${(dataUrl.length / 1048576).toFixed(1)} MB as data, ${Math.round(performance.now() - t0)} ms.`, 'ok');
+      }
+      const fail = (what, e) => log(`${what} failed: ${e?.message ?? e}`, 'err');
+      const readAsDataUrl = (blob) => new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result);
+        r.onerror = () => rej(r.error);
+        r.readAsDataURL(blob);
+      });
+      // the bridge: a paste into this panel
+      document.addEventListener('paste', async (e) => {
+        e.preventDefault();
+        const dt = e.clipboardData;
+        if (!dt) return log('The paste had no data.', 'err');
+        log(`Pasted: ${[...dt.types].join(', ') || 'nothing'}`);
+        const files = [...dt.files].filter((f) => f.type.startsWith('image/'));
+        try {
+          if (files.length) {
+            for (const f of files.slice(0, 20)) await picture(await readAsDataUrl(f), `${f.type}, ${(f.size / 1048576).toFixed(1)} MB`);
+            return;
+          }
+          const text = dt.getData('text/plain');
+          if (text) return await note(text);
+          log('Nothing in the paste this trial can use (pictures or text).', 'err');
+        } catch (err) {
+          fail('Creating it on the board', err);
+        }
+      });
+      function testPng(w, h, noisy) {
+        const cv = document.createElement('canvas');
+        cv.width = w;
+        cv.height = h;
+        const g = cv.getContext('2d');
+        const grad = g.createLinearGradient(0, 0, w, h);
+        grad.addColorStop(0, '#1971c2');
+        grad.addColorStop(1, '#e8590c');
+        g.fillStyle = grad;
+        g.fillRect(0, 0, w, h);
+        if (noisy) {
+          // noise makes the file big (the size-limit test)
+          const d = g.getImageData(0, 0, w, h);
+          for (let i = 0; i < d.data.length; i += 4) d.data[i] = (d.data[i] + Math.random() * 120) | 0;
+          g.putImageData(d, 0, 0);
+        }
+        g.fillStyle = '#fff';
+        g.font = `bold ${Math.round(h / 8)}px sans-serif`;
+        g.fillText('Orim → Miro', w * 0.08, h * 0.55);
+        return cv.toDataURL('image/png');
+      }
+      document.getElementById('t-note').onclick = () => note('Hello from the Orim app').catch((e) => fail('The test note', e));
+      document.getElementById('t-pic').onclick = () => picture(testPng(800, 500, false), 'test 800 × 500').catch((e) => fail('The test picture', e));
+      document.getElementById('t-big').onclick = () => picture(testPng(2400, 1600, true), 'test 2400 × 1600, noisy').catch((e) => fail('The big test picture', e));
+      document.getElementById('drop').focus();
+      miro.board.getInfo().then((b) => log(`Ready on board ${b.id}.`, 'ok')).catch((e) => fail('Talking to Miro', e));
+    </script>
+  </body>
+</html>
